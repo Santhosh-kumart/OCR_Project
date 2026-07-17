@@ -32,13 +32,28 @@ yolo, ocr = load_models()
 # Only allow plate-relevant characters so EasyOCR doesn't hallucinate symbols
 OCR_ALLOWLIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
+# Minimum detection confidence before we even trust that a plate was found
+YOLO_CONF_THRESHOLD = 0.4
+
+# Below this OCR confidence we tell the operator to double check / retake,
+# rather than silently showing a possibly-wrong guess as if it were reliable.
+OCR_CONF_WARN_THRESHOLD = 0.55
+
 # -----------------------------
 # CHARACTER CONFUSION MAPS
 # -----------------------------
 # NOTE: kept symmetric on purpose -- if a letter can be misread as a digit,
 # the digit can just as easily be misread as that letter (e.g. Z <-> 2).
-LETTER_TO_DIGIT = {"O": "0", "I": "1", "Z": "2", "S": "5", "B": "8", "G": "6", "Q": "0"}
-DIGIT_TO_LETTER = {"0": "O", "1": "I", "2": "Z", "5": "S", "8": "B", "6": "G"}
+# Expanded to cover a few more confusions common on Indian plates at low
+# resolution: A/4, D/0, T/7 (in addition to the original set).
+LETTER_TO_DIGIT = {
+    "O": "0", "I": "1", "Z": "2", "S": "5", "B": "8", "G": "6", "Q": "0",
+    "A": "4", "D": "0", "T": "7",
+}
+DIGIT_TO_LETTER = {
+    "0": "O", "1": "I", "2": "Z", "5": "S", "8": "B", "6": "G",
+    "4": "A", "7": "T",
+}
 
 
 def _normalize_segment(seg, to_digit):
@@ -54,9 +69,10 @@ def _normalize_segment(seg, to_digit):
 def extract_tn_number(text):
     """
     Extract a TN-format plate: TN + 2 digits + 1-2 letters + 4 digits.
-    Fixes common OCR confusions (O/0, I/1, S/5, B/8, Z/2 ...) but ONLY within
-    the segment where a digit or letter is actually expected, so real letters
-    like 'B' or 'S' inside the RTO code aren't wrongly turned into digits.
+    Fixes common OCR confusions (O/0, I/1, S/5, B/8, Z/2, A/4, D/0, T/7 ...)
+    but ONLY within the segment where a digit or letter is actually expected,
+    so real letters like 'B' or 'S' inside the RTO code aren't wrongly turned
+    into digits.
     """
     text = text.upper()
     text = re.sub(r"[^A-Z0-9]", "", text)  # strip spaces, dashes, punctuation
@@ -125,6 +141,55 @@ def extract_tn_number(text):
 
 
 # -----------------------------
+# DESKEW
+# -----------------------------
+def deskew_plate(plate_bgr):
+    """
+    Estimate and correct small rotation in the plate crop before OCR.
+    A YOLO box is always axis-aligned, so a plate photographed at an angle
+    still comes through as a tilted rectangle inside a straight crop -- that
+    tilt distorts character shapes far more than lighting does, and is a
+    common cause of OCR misreads. We find the dominant rectangle via the
+    largest contour on a thresholded version of the crop and rotate to
+    straighten it. If no reliable contour is found, the original image is
+    returned unchanged rather than risking a bad rotation.
+    """
+    gray = cv2.cvtColor(plate_bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return plate_bgr
+
+    largest = max(contours, key=cv2.contourArea)
+    # Ignore tiny/noisy contours that don't plausibly represent the plate body
+    if cv2.contourArea(largest) < 0.2 * plate_bgr.shape[0] * plate_bgr.shape[1]:
+        return plate_bgr
+
+    rect = cv2.minAreaRect(largest)
+    angle = rect[-1]
+
+    # cv2.minAreaRect returns angles in a way that needs normalizing --
+    # only correct small skews (a few degrees), since a large "angle" here
+    # usually means the contour wasn't actually the plate outline and
+    # rotating on it would make things worse, not better.
+    if angle < -45:
+        angle = 90 + angle
+    if abs(angle) < 1 or abs(angle) > 15:
+        return plate_bgr
+
+    (h, w) = plate_bgr.shape[:2]
+    center = (w // 2, h // 2)
+    rot_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotated = cv2.warpAffine(
+        plate_bgr, rot_matrix, (w, h),
+        flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
+    )
+    return rotated
+
+
+# -----------------------------
 # PLATE PREPROCESSING
 # -----------------------------
 def preprocess_variants(plate_img):
@@ -136,6 +201,7 @@ def preprocess_variants(plate_img):
     Trying multiple strategies and keeping whichever segments best fixes that.
     """
     plate = cv2.cvtColor(plate_img, cv2.COLOR_RGB2BGR)
+    plate = deskew_plate(plate)
     gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
 
     variants = []
@@ -217,7 +283,11 @@ if image_file:
 
     with st.spinner("🔍 Detecting Number Plate..."):
 
-        results = yolo(img)
+        # Filter out weak/spurious detections up front instead of blindly
+        # trusting the highest-confidence box among *any* detection, however
+        # low -- a 0.1-confidence box being treated as "the plate" is a common
+        # source of bad crops feeding into OCR.
+        results = yolo(img, conf=YOLO_CONF_THRESHOLD)
 
         plate_found = False
         plate_text_final = ""
@@ -279,17 +349,20 @@ if image_file:
     if not plate_found:
 
         st.error("❌ No Number Plate Detected")
+        st.button("🔄 Retake Photo")
 
     else:
 
         st.subheader("📄 OCR Output")
         st.write(plate_text_final)
 
-        if best_confidence < 0.30:
+        if best_confidence < OCR_CONF_WARN_THRESHOLD:
             st.warning(
                 f"⚠ Low OCR confidence ({best_confidence:.2f}) using the '{best_variant}' variant. "
-                "Result may be inaccurate — try a clearer, well-lit, closer photo."
+                "Result may be inaccurate — try a clearer, well-lit, closer, and straighter-angle photo, "
+                "or use the retake button below."
             )
+            st.button("🔄 Retake Photo")
 
         vehicle_number = extract_tn_number(plate_text_final)
 
